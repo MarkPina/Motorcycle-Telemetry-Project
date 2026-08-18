@@ -2,6 +2,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include "RingBuffer.h"
+#include "MPU6050.h"
+#include "GPSReader.h"
 
 const int SD_CS = 5;
 RingBuffer rb;

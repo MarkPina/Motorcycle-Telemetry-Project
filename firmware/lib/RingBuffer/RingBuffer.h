@@ -6,6 +6,11 @@ struct Sample {
     uint32_t timestamp_ms;
     float ax, ay, az;
     float gx, gy, gz;
+    float speed_mps;
+    float heading_deg;
+    double lat, lon;
+    bool  fix;
+    float lean_deg;
 };
 
 class RingBuffer {
