@@ -1,101 +1,91 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include <SD.h>
-#include "RingBuffer.h"
 #include "MPU6050.h"
-#include "GPSReader.h"
+#include "LeanFilter.h"
+#include "RingBuffer.h"
 
-const int SD_CS = 5;
-RingBuffer rb;
-File logFile;
+// --- pins ---
+const int I2C_SDA = 21;
+const int I2C_SCL = 22;
 
-// timing stats
-uint32_t writeCount = 0;
-uint32_t writeMaxUs = 0;
-uint32_t writeTotalUs = 0;
+// --- tuning ---
+const float kAlpha        = 0.99f;
+const float kLowSpeed     = 3.0f;
+const float kDegToRad     = 0.0174533f;
+const float kRadToDeg     = 57.29578f;
+const float kFakeSpeedMps = 15.0f;   // TEMPORARY: real GPS arrives in step 4
 
-char lineBuf[128];
-String batch;
+// --- shared objects ---
+MPU6050 imu;
+LeanFilter filter(kAlpha, kLowSpeed);
+QueueHandle_t imuQueue;
 
-void flushBatch() {
-    if (batch.length() == 0) return;
+void imuTask(void* pvParameters) {
+    TickType_t lastWake = xTaskGetTickCount();
 
-    uint32_t t0 = micros();
-    logFile.print(batch);
-    logFile.flush();
-    uint32_t dt = micros() - t0;
+    for (;;) {
+        Sample s;
+        if (imu.read(s)) {
+            s.timestamp_ms = millis();
+            xQueueSend(imuQueue, &s, 0);
+        }
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(10));   // 100 Hz
+    }
+}
 
-    writeCount++;
-    writeTotalUs += dt;
-    if (dt > writeMaxUs) writeMaxUs = dt;
+void fusionTask(void* pvParameters) {
+    Sample s;
+    uint32_t lastMicros = micros();
+    uint32_t lastPrint  = 0;
 
-    batch = "";
+    for (;;) {
+        if (xQueueReceive(imuQueue, &s, portMAX_DELAY) == pdTRUE) {
+            uint32_t now = micros();
+            float dt = (now - lastMicros) / 1000000.0f;
+            lastMicros = now;
+
+            float rollRate = s.gx * kDegToRad;
+            float yawRate = -s.gz * kDegToRad;
+
+            filter.update(rollRate, yawRate, kFakeSpeedMps, s.ay, s.az, dt);
+            s.lean_deg = filter.getLeanAngle() * kRadToDeg;
+
+            if (millis() - lastPrint > 100) {
+                lastPrint = millis();
+                Serial.print("a: ");
+                Serial.print(s.ax, 2); Serial.print(" ");
+                Serial.print(s.ay, 2); Serial.print(" ");
+                Serial.print(s.az, 2);
+                Serial.print("   g: ");
+                Serial.print(s.gx, 1); Serial.print(" ");
+                Serial.print(s.gy, 1); Serial.print(" ");
+                Serial.print(s.gz, 1);
+                Serial.print("   lean: ");
+                Serial.println(s.lean_deg, 2);
+            }
+        }
+    }
 }
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    if (!SD.begin(SD_CS, SPI, 1000000)) {
-        Serial.println("SD init FAILED");
-        return;
+    if (!imu.begin(I2C_SDA, I2C_SCL)) {
+        Serial.println("MPU init FAILED");
+        for (;;) delay(1000);
     }
-    Serial.println("SD init OK");
+    Serial.println("MPU init OK");
 
-    SD.remove("/batch.csv");
-    logFile = SD.open("/batch.csv", FILE_WRITE);
-    if (!logFile) {
-        Serial.println("open FAILED");
-        return;
-    }
-    logFile.println("timestamp_ms,ax,ay,az,gx,gy,gz");
-    batch.reserve(4096);
-
-    // produce 2000 synthetic samples at full tilt
-    for (uint32_t i = 0; i < 2000; i++) {
-        Sample s;
-        s.timestamp_ms = i * 10;
-        s.ax = 0.01f * i;  s.ay = 0.02f * i;  s.az = 1.0f;
-        s.gx = 0.1f * i;   s.gy = 0.2f * i;   s.gz = 0.3f * i;
-
-        if (!rb.push(s)) {
-        Serial.println("!! ring buffer full");
-        }
-
-        // drain in batches of 50
-        if (rb.count() >= 50) {
-        Sample out;
-        while (rb.pop(out)) {
-            snprintf(lineBuf, sizeof(lineBuf),
-                    "%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-                    out.timestamp_ms, out.ax, out.ay, out.az,
-                    out.gx, out.gy, out.gz);
-            batch += lineBuf;
-        }
-        flushBatch();
-        }
+    imuQueue = xQueueCreate(10, sizeof(Sample));
+    if (imuQueue == nullptr) {
+        Serial.println("queue create FAILED");
+        for (;;) delay(1000);
     }
 
-    // drain whatever's left
-    Sample out;
-    while (rb.pop(out)) {
-        snprintf(lineBuf, sizeof(lineBuf),
-                "%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-                out.timestamp_ms, out.ax, out.ay, out.az,
-                out.gx, out.gy, out.gz);
-        batch += lineBuf;
-    }
-    flushBatch();
-
-    size_t finalSize = logFile.size();
-    logFile.close();
-
-    Serial.println("--- results ---");
-    Serial.print("file size: ");      Serial.println(finalSize);
-    Serial.print("batch writes: ");   Serial.println(writeCount);
-    Serial.print("max write us: ");   Serial.println(writeMaxUs);
-    Serial.print("mean write us: ");  Serial.println(writeTotalUs / writeCount);
-    Serial.print("buffer high water: "); Serial.println(rb.highWaterMark());
+    xTaskCreatePinnedToCore(imuTask,    "imu",    4096, nullptr, 5, nullptr, 1);
+    xTaskCreatePinnedToCore(fusionTask, "fusion", 4096, nullptr, 4, nullptr, 1);
 }
 
-void loop() {}
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}

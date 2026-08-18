@@ -25,7 +25,7 @@ result was a clean cut at the hog's priority level:
 - Producer (5) ran normally (it preempted the hog every 100ms).
 - Consumer (3) never ran again.
 
-Blocking calls ('vTaskDelay', 'xQueueRecieve') yield the CPU voluntarily. A busy-wait
+Blocking calls ('vTaskDelay', 'xQueueReceive') yield the CPU voluntarily. A busy-wait
 doesn't, so anything below it is permanently starved.
 
 ## Task table

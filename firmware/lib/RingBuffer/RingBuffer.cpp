@@ -5,7 +5,7 @@ bool RingBuffer::push(const Sample& s) {
         return false;
     }
 
-    buffer_[head_] = s;\
+    buffer_[head_] = s;
     head_ = (head_ + 1) % kCapacity;
     count_++;
 
