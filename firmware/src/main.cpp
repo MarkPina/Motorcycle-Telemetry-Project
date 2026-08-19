@@ -30,6 +30,7 @@ SafeRingBuffer buffer;
 File logFile;
 char logLine[160];
 char logBatch[16384];
+uint32_t sdErrors = 0;
 
 void imuTask(void* pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
@@ -81,7 +82,8 @@ void fusionTask(void* pvParameters) {
                 Serial.print("   gz: ");   Serial.print(s.gz, 1);
                 Serial.print("   buf: ");   Serial.print(buffer.count());
                 Serial.print("   hwm: ");   Serial.print(buffer.highWaterMark());
-                Serial.print("   drop: ");  Serial.println(buffer.droppedCount());
+                Serial.print("   drop: ");  Serial.print(buffer.droppedCount());
+                Serial.print("   sderr: "); Serial.println(sdErrors);
             }
         }
     }
@@ -96,6 +98,14 @@ void gpsTask(void* pvParameters) {
         xQueueOverwrite(gpsMailbox, &fix);
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(50));   // 20 Hz
     }
+}
+
+void flushBatch(size_t len) {
+    size_t written = logFile.write((const uint8_t*)logBatch, len);
+    if (written != len) {
+        sdErrors++;
+    }
+    logFile.flush();
 }
 
 void loggerTask(void* pvParameters) {
@@ -115,18 +125,20 @@ void loggerTask(void* pvParameters) {
                 s.fix ? 1 : 0,
                 s.lean_deg);
 
-            if (used + n >= sizeof(logBatch)) break;   // flush what we have, get the rest next pass
+            if (used + n >= (int)sizeof(logBatch)) {
+                flushBatch(used);
+                used = 0;
+            }
             memcpy(logBatch + used, logLine, n);
             used += n;
         }
 
         if (used > 0) {
-            logFile.write((const uint8_t*)logBatch, used);
-            logFile.flush();
+            flushBatch(used);
             used = 0;
         }
 
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));   // 2 Hz
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
     }
 }
 
